@@ -1,0 +1,2162 @@
+# BeeAdmin（蜜蜂网管）完整开发文档 终极终版
+
+---
+
+## 一、项目定义
+
+```
+项目名称：BeeAdmin（蜜蜂网管）
+定位：开源、轻量、快速的网络设备管理系统
+技术栈：Python 3.10 + Django 5.2 + MySQL 8.0 + Redis 7 + Celery
+前端：Vue3 + Element Plus + Pinia
+```
+
+### 1.1 管理对象
+
+```
+网络设备：路由器、交换机、防火墙等
+登录方式：SSH、Telnet（已实现）；串口、Web（已标记，暂不实现）
+```
+
+### 1.2 核心原则
+
+```
+不依赖 SNMP：避免园区网 SNMP 部署少导致无法使用 Zabbix 的问题
+纯 CLI 驱动：通过 SSH/Telnet 命令行采集和管理
+TextFSM 解析 + Jinja2 输出：不存储固定模板的命令和原始结果
+敏感信息加盐加密存储
+轻量高效：一键查看、一键巡检、一键导出
+连接最小化：连接只做连接的事，连接完立刻断开，解析和渲染消费缓存
+```
+
+### 1.3 核心功能
+
+```
+设备扫描：扫描 IP 段或多地址，自动发现设备并入库
+设备巡检：定时/手动巡检，三段管道（采集→解析→渲染），TextFSM + Jinja2
+存活检测：Ping + TCP 检测，延迟/带宽/连接数监控，上下线通知
+配置管理：运行配置/启动配置备份，左右编辑器对比差异标红
+即时登录：SSH/Telnet 终端，操作日志录制
+AI 助手：悬浮窗口，DeepSeek API，分析终端输出给出建议
+信息导出：可选字段导出设备信息，导出巡检报告 TXT
+```
+
+---
+
+## 二、系统架构
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│  前端                                                            │
+│  ┌──────────────────┐  ┌──────────────────┐                     │
+│  │  PC Web (Vue3)   │  │  Mobile Web      │                     │
+│  │  Element Plus    │  │  (Vue3 响应式)    │                     │
+│  │  Pinia           │  │                  │                     │
+│  └────────┬─────────┘  └────────┬─────────┘                     │
+│           │  HTTP / WebSocket   │                               │
+├───────────┴─────────────────────┴───────────────────────────────┤
+│  后端                                                            │
+│  ┌──────────────────────────────────────────────────────────┐   │
+│  │  Django 5.2 + Django REST Framework                       │   │
+│  │  Django Channels (WebSocket)                              │   │
+│  │                                                          │   │
+│  │  Apps:                                                   │   │
+│  │  accounts / devices / scanning / inspection /            │   │
+│  │  alive / terminal / notification / ai / system           │   │
+│  └──────────────────────────────────────────────────────────┘   │
+│                                                                  │
+│  ┌──────────────┐  ┌──────────────┐  ┌──────────────────────┐   │
+│  │  Celery       │  │  Redis        │  │  Engine              │   │
+│  │  Workers      │  │  DB0: Cache   │  │  SSH / Telnet        │   │
+│  │              │  │  DB1: Broker  │  │  TextFSM / Jinja2    │   │
+│  │  Queues:     │  │  DB2: Result  │  │  Ping / TCP          │   │
+│  │  - collect   │  │  DB3: Collect │  │  Connection Pool     │   │
+│  │  - parse     │  │  DB4: Alive   │  │  Config Manager      │   │
+│  │  - render    │  │  DB5: Scan    │  │  Device Detector     │   │
+│  │  - alive     │  │              │  │  Crypto              │   │
+│  │  - scan      │  │              │  │                      │   │
+│  │  - notify    │  │              │  │                      │   │
+│  │  - default   │  │              │  │                      │   │
+│  └──────────────┘  └──────────────┘  └──────────────────────┘   │
+│                                                                  │
+│  ┌──────────────────────────────────────────────────────────┐   │
+│  │  MySQL 8.0                                                │   │
+│  └──────────────────────────────────────────────────────────┘   │
+├─────────────────────────────────────────────────────────────────┤
+│  目标设备（零侵入）                                               │
+│  ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌──────────┐           │
+│  │ 交换机    │ │ 路由器    │ │ 防火墙    │ │ 其他设备  │           │
+│  │ SSH/Tel  │ │ SSH/Tel  │ │ SSH/Tel  │ │ SSH/Tel  │           │
+│  └──────────┘ └──────────┘ └──────────┘ └──────────┘           │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### 2.1 三段管道架构
+
+```
+核心理念：连接只做连接的事，连接完立刻断开，解析和渲染消费缓存
+
+┌──────────┐     Redis 缓存     ┌──────────┐     Redis 缓存     ┌──────────┐
+│ 采集队列   │ ──────────────→  │ 解析队列   │ ──────────────→  │ 渲染队列   │
+│ collect   │   (DB3)           │ parse     │   (DB3)           │ render    │
+│           │                   │           │                   │           │
+│ 连接设备   │                   │ TextFSM   │                   │ Jinja2    │
+│ 执行命令   │                   │ 解析结果   │                   │ 生成报告   │
+│ 存入缓存   │                   │ 存入数据库 │                   │ 导出文件   │
+│ 立即断开   │                   │           │                   │           │
+│           │                   │ 不需要连接  │                   │ 不需要连接  │
+│ concurrency=1                 │ concurrency=4                │ concurrency=4
+│ 串行连接   │                   │ 并发解析   │                   │ 并发渲染   │
+└──────────┘                   └──────────┘                   └──────────┘
+
+连接生命周期：
+  连接 → 逐条执行所有命令 → 每条命令输出存入 Redis Hash → 全部执行完立即断开
+  单台设备连接时间：秒级
+```
+
+### 2.2 Celery 队列设计
+
+```
+┌──────────────────┬──────────────────────────────────────────────┐
+│ 队列名            │ 职责                                         │
+├──────────────────┼──────────────────────────────────────────────┤
+│ queue:collect     │ 连接设备、执行命令、存缓存、断开连接            │
+│                  │ concurrency=1，串行连接，避免连接风暴           │
+├──────────────────┼──────────────────────────────────────────────┤
+│ queue:parse       │ 从 Redis 读取原始输出、TextFSM 解析、存入 DB   │
+│                  │ concurrency=4，可并发，纯 CPU 计算             │
+├──────────────────┼──────────────────────────────────────────────┤
+│ queue:render      │ 从 Redis 读取解析结果、Jinja2 渲染、生成报告   │
+│                  │ concurrency=4，可并发，纯文本处理              │
+├──────────────────┼──────────────────────────────────────────────┤
+│ queue:alive       │ 存活检测（Ping + TCP）                        │
+│                  │ 独立队列，严格控制并发和带宽                    │
+├──────────────────┼──────────────────────────────────────────────┤
+│ queue:scan        │ 设备扫描（端口探测 + 设备识别）                │
+│                  │ rate_limit 限制，避免扫描风暴                  │
+├──────────────────┼──────────────────────────────────────────────┤
+│ queue:notify      │ 通知发送（站内 + 邮件）                       │
+│                  │ 低优先级，不影响其他队列                        │
+├──────────────────┼──────────────────────────────────────────────┤
+│ queue:default     │ 其他任务（配置备份、信息采集、系统维护）        │
+└──────────────────┴──────────────────────────────────────────────┘
+```
+
+### 2.3 Redis 数据库分配
+
+```
+DB 0 → Django Cache（会话、临时数据、主密码密钥缓存）
+DB 1 → Celery Broker（任务队列）
+DB 2 → Celery Result Backend（任务结果）
+DB 3 → 设备数据缓存（采集原始输出、解析结果、连接锁）
+DB 4 → 存活检测缓存（检测结果、连接计数器）
+DB 5 → 扫描缓存（扫描原始输出）
+```
+
+---
+
+## 三、仓库目录结构
+
+```
+beeadmin/
+│
+├── backend/                           ← Django 后端
+│   ├── manage.py
+│   ├── beeadmin/                      ← Django 项目配置
+│   │   ├── __init__.py
+│   │   ├── settings/
+│   │   │   ├── __init__.py
+│   │   │   ├── base.py
+│   │   │   ├── dev.py
+│   │   │   └── prod.py
+│   │   ├── urls.py
+│   │   ├── wsgi.py
+│   │   ├── asgi.py
+│   │   └── celery.py                  ← Celery 应用实例 + 队列配置
+│   │
+│   ├── apps/
+│   │   ├── accounts/                  ← 用户认证
+│   │   │   ├── models.py
+│   │   │   ├── serializers.py
+│   │   │   ├── views.py
+│   │   │   ├── urls.py
+│   │   │   └── admin.py
+│   │   │
+│   │   ├── devices/                   ← 设备管理
+│   │   │   ├── models.py
+│   │   │   ├── serializers.py
+│   │   │   ├── views.py
+│   │   │   ├── urls.py
+│   │   │   ├── tasks.py
+│   │   │   └── admin.py
+│   │   │
+│   │   ├── scanning/                  ← 设备扫描
+│   │   │   ├── models.py
+│   │   │   ├── serializers.py
+│   │   │   ├── views.py
+│   │   │   ├── urls.py
+│   │   │   └── tasks.py
+│   │   │
+│   │   ├── inspection/                ← 巡检管理
+│   │   │   ├── models.py
+│   │   │   ├── serializers.py
+│   │   │   ├── views.py
+│   │   │   ├── urls.py
+│   │   │   └── tasks.py
+│   │   │
+│   │   ├── alive/                     ← 存活检测
+│   │   │   ├── models.py
+│   │   │   ├── serializers.py
+│   │   │   ├── views.py
+│   │   │   ├── urls.py
+│   │   │   └── tasks.py
+│   │   │
+│   │   ├── terminal/                  ← 终端连接
+│   │   │   ├── consumers.py
+│   │   │   ├── routing.py
+│   │   │   ├── views.py
+│   │   │   └── urls.py
+│   │   │
+│   │   ├── notification/              ← 通知管理
+│   │   │   ├── models.py
+│   │   │   ├── serializers.py
+│   │   │   ├── views.py
+│   │   │   ├── urls.py
+│   │   │   └── tasks.py
+│   │   │
+│   │   ├── ai/                        ← AI 助手
+│   │   │   ├── models.py
+│   │   │   ├── serializers.py
+│   │   │   ├── views.py
+│   │   │   └── urls.py
+│   │   │
+│   │   └── system/                    ← 系统设置
+│   │       ├── models.py
+│   │       ├── serializers.py
+│   │       ├── views.py
+│   │       ├── urls.py
+│   │       └── tasks.py
+│   │
+│   ├── engine/                        ← 核心引擎
+│   │   ├── __init__.py
+│   │   ├── ssh.py
+│   │   ├── telnet.py
+│   │   ├── connection_pool.py
+│   │   ├── cache.py                   ← Redis 缓存管理器
+│   │   ├── textfsm_parser.py
+│   │   ├── jinja2_renderer.py
+│   │   ├── device_detector.py
+│   │   ├── config_manager.py
+│   │   ├── ping.py
+│   │   ├── tcp_check.py
+│   │   └── crypto.py                  ← 加盐加密模块
+│   │
+│   ├── requirements.txt
+│   ├── Dockerfile
+│   └── entrypoint.sh
+│
+├── frontend-pc/                       ← PC 前端
+│   ├── src/
+│   │   ├── main.ts
+│   │   ├── App.vue
+│   │   ├── router/index.ts
+│   │   ├── stores/
+│   │   │   ├── app.ts
+│   │   │   ├── auth.ts
+│   │   │   ├── dashboard.ts
+│   │   │   ├── device.ts
+│   │   │   ├── deviceGroup.ts
+│   │   │   ├── scanning.ts
+│   │   │   ├── inspection.ts
+│   │   │   ├── alive.ts
+│   │   │   ├── terminal.ts
+│   │   │   ├── notification.ts
+│   │   │   ├── ai.ts
+│   │   │   └── settings.ts
+│   │   ├── views/
+│   │   │   ├── auth/Login.vue, Setup.vue
+│   │   │   ├── Dashboard.vue
+│   │   │   ├── devices/DeviceList.vue, DeviceDetail.vue, ScanTasks.vue,
+│   │   │   │         InspectionManage.vue, AliveDetection.vue, ExecutionHistory.vue
+│   │   │   ├── instant/InstantLogin.vue
+│   │   │   └── settings/Settings.vue
+│   │   ├── components/
+│   │   │   ├── layout/AppLayout.vue, SideMenu.vue, TopBar.vue, StatusBar.vue
+│   │   │   ├── device/DeviceTable.vue, DeviceForm.vue, DeviceGroupTabs.vue, DeviceStatusBadge.vue
+│   │   │   ├── detail/OverviewTab.vue, InterfaceTab.vue, RouteTab.vue, ArpTab.vue,
+│   │   │   │         MacTab.vue, ConfigDiffTab.vue, InspectionHistoryTab.vue
+│   │   │   ├── terminal/SSHTerminal.vue
+│   │   │   ├── scanning/ScanTaskForm.vue, ScanResultTable.vue
+│   │   │   ├── inspection/TemplateEditor.vue, InspectionTaskForm.vue, InspectionResultView.vue
+│   │   │   ├── alive/AliveTaskForm.vue, AliveStatusGrid.vue
+│   │   │   ├── config/ConfigDiffViewer.vue
+│   │   │   ├── export/ExportDialog.vue
+│   │   │   ├── ai/AIFloatingWindow.vue
+│   │   │   └── common/StatusBadge.vue, EmptyState.vue, ConfirmDialog.vue
+│   │   ├── api/
+│   │   │   ├── request.ts
+│   │   │   ├── auth.ts, dashboard.ts, device.ts, scanning.ts,
+│   │   │   │   inspection.ts, alive.ts, terminal.ts, notification.ts,
+│   │   │   │   ai.ts, settings.ts
+│   │   ├── utils/websocket.ts, crypto.ts, format.ts
+│   │   └── styles/variables.css, global.css
+│   ├── index.html
+│   ├── vite.config.ts
+│   └── package.json
+│
+├── frontend-mobile/                   ← 手机 Web 前端
+│   ├── src/
+│   │   ├── main.ts
+│   │   ├── App.vue
+│   │   ├── router/index.ts
+│   │   ├── stores/...
+│   │   ├── views/
+│   │   │   ├── auth/Login.vue
+│   │   │   ├── Dashboard.vue
+│   │   │   ├── devices/DeviceList.vue, DeviceDetail.vue
+│   │   │   ├── terminal/MobileTerminal.vue
+│   │   │   ├── inspection/InspectionResult.vue
+│   │   │   └── settings/Settings.vue
+│   │   ├── components/
+│   │   │   ├── layout/MobileLayout.vue, BottomNav.vue
+│   │   │   └── ai/AIFloatingButton.vue
+│   │   ├── api/...
+│   │   └── styles/mobile.css
+│   ├── index.html
+│   ├── vite.config.ts
+│   └── package.json
+│
+├── templates/                         ← TextFSM + Jinja2 模板文件
+│   ├── textfsm/
+│   │   ├── cisco_ios/
+│   │   │   ├── show_version.textfsm
+│   │   │   ├── show_ip_interface_brief.textfsm
+│   │   │   ├── show_interfaces.textfsm
+│   │   │   ├── show_processes_cpu.textfsm
+│   │   │   ├── show_memory_statistics.textfsm
+│   │   │   ├── show_mac_address_table.textfsm
+│   │   │   ├── show_arp.textfsm
+│   │   │   ├── show_ip_route.textfsm
+│   │   │   ├── show_logging.textfsm
+│   │   │   └── show_running_config.textfsm
+│   │   ├── huawei_vrp/
+│   │   │   ├── display_version.textfsm
+│   │   │   ├── display_ip_interface_brief.textfsm
+│   │   │   ├── display_interface_brief.textfsm
+│   │   │   ├── display_cpu_usage.textfsm
+│   │   │   ├── display_memory.textfsm
+│   │   │   ├── display_mac_address.textfsm
+│   │   │   ├── display_arp.textfsm
+│   │   │   ├── display_ip_routing_table.textfsm
+│   │   │   ├── display_logbuffer.textfsm
+│   │   │   └── display_current_configuration.textfsm
+│   │   └── h3c_comware/
+│   │       └── ...
+│   │
+│   └── jinja2/
+│       ├── inspection_basic.txt.j2
+│       ├── inspection_full.txt.j2
+│       └── device_export.csv.j2
+│
+├── docker-compose.yml
+├── .gitignore
+├── LICENSE
+└── README.md
+```
+
+---
+
+## 四、开发迭代步骤
+
+### Step 1：所有端的基本项目框架
+
+**目标：** 每个组件能独立启动运行，健康检查通过。
+
+**backend/：**
+```
+□ Django 5.2 项目骨架
+□ settings 分环境配置（base/dev/prod）
+□ MySQL 数据库连接
+□ Redis 连接配置（DB0-DB5 分配）
+□ Celery 应用实例 + 七个队列定义
+□ Celery beat 调度器
+□ Django Channels (ASGI) 配置
+□ 所有 app 注册（空 models.py）
+□ /api/v1/health/ 健康检查（Django/MySQL/Redis/Celery 状态）
+□ requirements.txt
+□ Dockerfile
+□ entrypoint.sh
+```
+
+**frontend-pc/：**
+```
+□ Vue3 + Vite + Element Plus + Pinia 骨架
+□ 整体布局（左侧小菜单 64px + 顶栏 + 主内容区 + 状态栏）
+□ 小菜单项：仪表盘/设备/即时登录/系统设置
+□ 设备二级 Tab：设备列表/扫描任务/巡检管理/存活检测/执行记录
+□ 路由配置（空页面占位）
+□ Axios + WebSocket 封装
+□ Login.vue / Setup.vue 占位
+```
+
+**frontend-mobile/：**
+```
+□ Vue3 + Vite 骨架
+□ 底部导航（首页/设备/巡检/设置）
+□ 路由配置（空页面占位）
+□ Axios 封装
+```
+
+**templates/：**
+```
+□ TextFSM 模板目录结构（cisco_ios/huawei_vrp/h3c_comware）
+□ Jinja2 模板目录结构
+□ 每个目录放占位 README.md
+```
+
+**根目录：**
+```
+□ docker-compose.yml
+□ .gitignore / LICENSE / README.md
+```
+
+**PR：** `feat: Step 1 - 初始化所有端项目框架`
+
+---
+
+### Step 2：后端完整功能
+
+**目标：** 所有 API 可用，所有 Celery 任务可执行，三段管道跑通。
+
+**PR：** `feat: Step 2 - 完成后端全部功能`
+
+---
+
+### Step 3：PC 前端 + 手机前端
+
+**目标：** 完整图形界面，所有功能可用。
+
+**PR：** `feat: Step 3 - 完成 PC 前端和手机前端`
+
+---
+
+### Step 4：集成测试
+
+**目标：** 用真实网络设备跑通完整流程。
+
+**PR：** `test: Step 4 - 集成测试完整流程，修复问题`
+
+---
+
+## 五、数据库模型
+
+### 5.1 accounts 应用
+
+```python
+# Django 内置 auth_user 够用，无需扩展
+```
+
+### 5.2 devices 应用
+
+```python
+class DeviceGroup(models.Model):
+    name = models.CharField(max_length=128)
+    description = models.TextField(blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+class Credential(models.Model):
+    LOGIN_METHOD_CHOICES = [
+        ('ssh', 'SSH'),
+        ('telnet', 'Telnet'),
+        ('console', '串口（暂不实现）'),
+        ('web', 'Web（暂不实现）'),
+    ]
+    name = models.CharField(max_length=128)
+    login_method = models.CharField(max_length=16, choices=LOGIN_METHOD_CHOICES)
+    username = models.CharField(max_length=128)
+    password = models.TextField()           # 加盐加密
+    enable_password = models.TextField(blank=True)  # 加盐加密
+    ssh_key = models.TextField(blank=True)          # 加盐加密
+    created_at = models.DateTimeField(auto_now_add=True)
+
+class Device(models.Model):
+    DEVICE_TYPE_CHOICES = [
+        ('router', '路由器'),
+        ('switch', '交换机'),
+        ('firewall', '防火墙'),
+        ('other', '其他'),
+    ]
+    STATUS_CHOICES = [
+        ('online', '在线'),
+        ('offline', '离线'),
+        ('unknown', '未知'),
+    ]
+    name = models.CharField(max_length=128, unique=True)
+    ip = models.GenericIPAddressField()
+    port = models.IntegerField(default=22)
+    device_type = models.CharField(max_length=32, choices=DEVICE_TYPE_CHOICES, default='switch')
+    vendor = models.CharField(max_length=64, blank=True)
+    model = models.CharField(max_length=128, blank=True)
+    os_version = models.CharField(max_length=256, blank=True)
+    serial_number = models.CharField(max_length=128, blank=True)
+    hostname = models.CharField(max_length=256, blank=True)
+    login_method = models.CharField(max_length=16, default='ssh')
+    credential = models.ForeignKey(Credential, on_delete=models.SET_NULL, null=True)
+    group = models.ForeignKey(DeviceGroup, on_delete=models.SET_NULL, null=True, blank=True)
+    status = models.CharField(max_length=16, choices=STATUS_CHOICES, default='unknown')
+    uptime = models.CharField(max_length=256, blank=True)
+    cpu_usage = models.DecimalField(max_digits=5, decimal_places=2, null=True)
+    memory_usage = models.DecimalField(max_digits=5, decimal_places=2, null=True)
+    interface_count = models.IntegerField(null=True)
+    bandwidth_mbps = models.DecimalField(max_digits=10, decimal_places=2, null=True)
+    last_seen_at = models.DateTimeField(null=True)
+    last_inspection_at = models.DateTimeField(null=True)
+    last_backup_at = models.DateTimeField(null=True)
+    notes = models.TextField(blank=True)
+    tags = models.CharField(max_length=512, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+class DeviceInfo(models.Model):
+    device = models.ForeignKey(Device, on_delete=models.CASCADE)
+    info_type = models.CharField(max_length=64)
+    data = models.JSONField()
+    collected_at = models.DateTimeField()
+
+class ConfigBackup(models.Model):
+    CONFIG_TYPE_CHOICES = [
+        ('running', '运行配置'),
+        ('startup', '启动配置'),
+    ]
+    device = models.ForeignKey(Device, on_delete=models.CASCADE)
+    config_type = models.CharField(max_length=16, choices=CONFIG_TYPE_CHOICES)
+    content = models.TextField()
+    version = models.IntegerField()
+    created_at = models.DateTimeField(auto_now_add=True)
+```
+
+### 5.3 scanning 应用
+
+```python
+class ScanTask(models.Model):
+    SCAN_TYPE_CHOICES = [
+        ('periodic', '周期执行'),
+        ('interval', '间隔执行'),
+        ('manual', '手动执行'),
+    ]
+    name = models.CharField(max_length=128)
+    targets = models.TextField()            # IP 范围和列表
+    scan_type = models.CharField(max_length=16, choices=SCAN_TYPE_CHOICES, default='manual')
+    cron_expr = models.CharField(max_length=128, blank=True)
+    interval_seconds = models.IntegerField(null=True)
+    credential = models.ForeignKey(Credential, on_delete=models.SET_NULL, null=True)
+    port = models.IntegerField(default=22)
+    auto_add = models.BooleanField(default=True)
+    auto_verify = models.BooleanField(default=True)
+    enabled = models.BooleanField(default=True)
+    last_run_at = models.DateTimeField(null=True)
+    next_run_at = models.DateTimeField(null=True)
+    status = models.CharField(max_length=16, default='idle')
+    created_at = models.DateTimeField(auto_now_add=True)
+
+class ScanResult(models.Model):
+    STATUS_CHOICES = [
+        ('found', '已发现'),
+        ('not_found', '未发现'),
+        ('error', '错误'),
+    ]
+    task = models.ForeignKey(ScanTask, on_delete=models.CASCADE)
+    ip = models.GenericIPAddressField()
+    port = models.IntegerField()
+    status = models.CharField(max_length=16, choices=STATUS_CHOICES)
+    vendor = models.CharField(max_length=64, blank=True)
+    model = models.CharField(max_length=128, blank=True)
+    os_version = models.CharField(max_length=256, blank=True)
+    hostname = models.CharField(max_length=256, blank=True)
+    device = models.ForeignKey(Device, on_delete=models.SET_NULL, null=True, blank=True)
+    raw_output = models.TextField(blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+```
+
+### 5.4 inspection 应用
+
+```python
+class InspectionTemplate(models.Model):
+    name = models.CharField(max_length=128)
+    description = models.TextField(blank=True)
+    vendor = models.CharField(max_length=64, blank=True)  # 空=通用
+    commands = models.JSONField()           # 有序命令列表
+    textfsm_mapping = models.JSONField()    # 命令别名→TextFSM模板映射
+    jinja2_template_name = models.CharField(max_length=256, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+class InspectionTask(models.Model):
+    SCHEDULE_TYPE_CHOICES = [
+        ('periodic', '周期执行'),
+        ('manual', '手动执行'),
+    ]
+    name = models.CharField(max_length=128)
+    device_ids = models.JSONField()
+    template = models.ForeignKey(InspectionTemplate, on_delete=models.CASCADE)
+    schedule_type = models.CharField(max_length=16, choices=SCHEDULE_TYPE_CHOICES, default='manual')
+    cron_expr = models.CharField(max_length=128, blank=True)
+    enabled = models.BooleanField(default=True)
+    last_run_at = models.DateTimeField(null=True)
+    next_run_at = models.DateTimeField(null=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+class InspectionResult(models.Model):
+    STATUS_CHOICES = [
+        ('collecting', '采集中'),
+        ('collected', '采集完成'),
+        ('parsing', '解析中'),
+        ('parsed', '解析完成'),
+        ('rendering', '渲染中'),
+        ('success', '成功'),
+        ('collect_failed', '采集失败'),
+        ('parse_failed', '解析失败'),
+        ('render_failed', '渲染失败'),
+    ]
+    task = models.ForeignKey(InspectionTask, on_delete=models.CASCADE)
+    device = models.ForeignKey(Device, on_delete=models.CASCADE)
+    template = models.ForeignKey(InspectionTemplate, on_delete=models.CASCADE)
+    parsed_data = models.JSONField(null=True)
+    report_content = models.TextField(blank=True)
+    report_file_path = models.CharField(max_length=512, blank=True)
+    status = models.CharField(max_length=16, choices=STATUS_CHOICES, default='collecting')
+    error_message = models.TextField(blank=True)
+    started_at = models.DateTimeField(null=True)
+    finished_at = models.DateTimeField(null=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+```
+
+### 5.5 alive 应用
+
+```python
+class AliveTask(models.Model):
+    CHECK_TYPE_CHOICES = [
+        ('ping', 'Ping'),
+        ('tcp', 'TCP'),
+        ('both', 'Ping + TCP'),
+    ]
+    name = models.CharField(max_length=128)
+    device_ids = models.JSONField()
+    check_type = models.CharField(max_length=16, choices=CHECK_TYPE_CHOICES, default='both')
+    interval_seconds = models.IntegerField(default=60)
+    timeout_seconds = models.IntegerField(default=5)
+    bandwidth_limit_mbps = models.DecimalField(max_digits=10, decimal_places=2)
+    connection_limit = models.IntegerField()
+    notify_email = models.BooleanField(default=False)
+    enabled = models.BooleanField(default=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+class AliveResult(models.Model):
+    task = models.ForeignKey(AliveTask, on_delete=models.CASCADE)
+    device = models.ForeignKey(Device, on_delete=models.CASCADE)
+    is_alive = models.BooleanField()
+    latency_ms = models.DecimalField(max_digits=10, decimal_places=2, null=True)
+    packet_loss_percent = models.DecimalField(max_digits=5, decimal_places=2, null=True)
+    bandwidth_usage_mbps = models.DecimalField(max_digits=10, decimal_places=2, null=True)
+    connection_count = models.IntegerField(null=True)
+    checked_at = models.DateTimeField()
+```
+
+### 5.6 notification 应用
+
+```python
+class Notification(models.Model):
+    TYPE_CHOICES = [
+        ('device_online', '设备上线'),
+        ('device_offline', '设备离线'),
+        ('scan_complete', '扫描完成'),
+        ('inspection_complete', '巡检完成'),
+        ('alive_alert', '存活告警'),
+    ]
+    type = models.CharField(max_length=32, choices=TYPE_CHOICES)
+    title = models.CharField(max_length=256)
+    message = models.TextField()
+    device = models.ForeignKey(Device, on_delete=models.SET_NULL, null=True, blank=True)
+    is_read = models.BooleanField(default=False)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+class EmailConfig(models.Model):
+    smtp_host = models.CharField(max_length=256)
+    smtp_port = models.IntegerField(default=465)
+    use_tls = models.BooleanField(default=True)
+    sender_email = models.CharField(max_length=256)
+    sender_password = models.TextField()    # 加盐加密
+    enabled = models.BooleanField(default=False)
+    updated_at = models.DateTimeField(auto_now=True)
+```
+
+### 5.7 system 应用
+
+```python
+class SystemSetting(models.Model):
+    key = models.CharField(max_length=128, primary_key=True)
+    value = models.TextField()
+    updated_at = models.DateTimeField(auto_now=True)
+
+class AutoBackupConfig(models.Model):
+    backup_running_config = models.BooleanField(default=True)
+    backup_startup_config = models.BooleanField(default=True)
+    schedule_type = models.CharField(max_length=16, default='daily')
+    cron_expr = models.CharField(max_length=128, default='0 2 * * *')
+    enabled = models.BooleanField(default=True)
+    last_run_at = models.DateTimeField(null=True)
+    next_run_at = models.DateTimeField(null=True)
+```
+
+### 5.8 ai 应用
+
+```python
+class AIConfig(models.Model):
+    api_key = models.TextField()            # 加盐加密
+    base_url = models.CharField(max_length=512, default='https://api.deepseek.com')
+    model = models.CharField(max_length=128, default='deepseek-chat')
+    temperature = models.DecimalField(max_digits=3, decimal_places=2, default=0.30)
+    updated_at = models.DateTimeField(auto_now=True)
+```
+
+### 5.9 terminal 应用
+
+```python
+class InstantLoginRecord(models.Model):
+    host = models.CharField(max_length=256)
+    port = models.IntegerField()
+    login_method = models.CharField(max_length=16)
+    username = models.CharField(max_length=128)
+    recorded = models.BooleanField(default=True)
+    log_path = models.CharField(max_length=512, blank=True)
+    duration_seconds = models.IntegerField(null=True)
+    connected_at = models.DateTimeField(null=True)
+    disconnected_at = models.DateTimeField(null=True)
+```
+
+---
+
+## 六、引擎模块
+
+### 6.1 SSH 客户端（engine/ssh.py）
+
+```python
+class SSHClient:
+    def connect(self, host, port, username, password=None, key=None):
+        """建立 SSH 连接"""
+        # 使用 paramiko
+
+    def execute(self, command, timeout=30):
+        """执行单条命令，返回输出文本"""
+
+    def execute_batch(self, commands, timeout=30):
+        """逐条执行命令，返回 {alias: output} 字典"""
+        # 在同一连接内逐条执行
+        # 每条命令等待提示符后再发下一条
+
+    def close(self):
+        """关闭连接"""
+```
+
+### 6.2 Telnet 客户端（engine/telnet.py）
+
+```python
+class TelnetClient:
+    def connect(self, host, port, username, password):
+        """建立 Telnet 连接，处理登录交互"""
+        # 等待 Username: → 发送用户名
+        # 等待 Password: → 发送密码
+        # 等待提示符 → 登录成功
+
+    def execute(self, command, timeout=30):
+        """执行单条命令"""
+        # 发送命令
+        # 等待提示符
+        # 处理分页（--More--）
+        # 返回输出文本
+
+    def execute_batch(self, commands, timeout=30):
+        """逐条执行命令"""
+        # 在同一连接内逐条执行
+
+    def _wait_for_prompt(self, timeout):
+        """等待提示符"""
+
+    def _handle_pagination(self):
+        """处理分页"""
+
+    def _detect_prompt(self):
+        """自动检测提示符"""
+
+    def close(self):
+        """关闭连接"""
+```
+
+### 6.3 连接锁（engine/cache.py）
+
+```python
+class DeviceDataCache:
+    """Redis 缓存管理器"""
+
+    def __init__(self):
+        # 连接 Redis DB3（设备数据缓存）
+
+    # ===== 连接锁 =====
+    def acquire_device_lock(self, device_id, timeout=60):
+        """获取设备连接锁，防止并发连接同一设备"""
+        # beeadmin:lock:collect:{device_id} → SET NX EX 60
+
+    def release_device_lock(self, device_id):
+        """释放设备连接锁"""
+
+    # ===== 巡检采集缓存 =====
+    def store_raw_output(self, result_id, device_id, command_alias, raw_output):
+        """存储单条命令原始输出到 Redis Hash"""
+        # beeadmin:collect:{result_id}:{device_id}:raw → HSET {alias} {output}
+        # TTL: 30 分钟
+
+    def get_raw_outputs(self, result_id, device_id):
+        """获取所有命令原始输出"""
+        # HGETALL
+
+    def delete_raw_outputs(self, result_id, device_id):
+        """删除原始输出缓存"""
+
+    # ===== 巡检解析缓存 =====
+    def store_parsed_data(self, result_id, device_id, parsed_data):
+        """存储解析结果"""
+        # beeadmin:parse:{result_id}:{device_id}:parsed → SET JSON
+        # TTL: 30 分钟
+
+    def get_parsed_data(self, result_id, device_id):
+        """获取解析结果"""
+
+    def delete_parsed_data(self, result_id, device_id):
+        """删除解析缓存"""
+
+    # ===== 扫描缓存 =====
+    def store_scan_raw(self, task_id, ip, raw_output):
+        # beeadmin:scan:{task_id}:{ip}:raw → SET
+        # TTL: 10 分钟
+
+    def get_scan_raw(self, task_id, ip):
+        # GET
+
+    # ===== 存活检测缓存 =====
+    def store_alive_result(self, task_id, device_id, result):
+        # beeadmin:alive:{task_id}:{device_id}:result → SET JSON
+        # TTL: 5 分钟
+
+    def get_alive_result(self, task_id, device_id):
+        # GET
+
+    # ===== 连接计数器 =====
+    def incr_alive_connections(self):
+        # INCR beeadmin:alive:active_connections
+
+    def decr_alive_connections(self):
+        # DECR beeadmin:alive:active_connections
+
+    def get_alive_connections(self):
+        # GET beeadmin:alive:active_connections
+```
+
+### 6.4 TextFSM 解析器（engine/textfsm_parser.py）
+
+```python
+class TextFSMParser:
+    def __init__(self):
+        # 模板目录：templates/textfsm/
+
+    def parse(self, vendor, template_name, raw_output):
+        """
+        加载 TextFSM 模板，解析原始输出
+        返回 list of dict
+        """
+        # 模板路径：templates/textfsm/{vendor}/{template_name}.textfsm
+        # 使用 textfsm 库
+
+    def get_template_path(self, vendor, template_name):
+        """获取模板文件路径"""
+```
+
+### 6.5 Jinja2 渲染器（engine/jinja2_renderer.py）
+
+```python
+class Jinja2Renderer:
+    def __init__(self):
+        # 模板目录：templates/jinja2/
+        # 使用 jinja2 库
+
+    def render(self, template_name, context):
+        """
+        渲染 Jinja2 模板
+        template_name: 模板文件名（如 inspection_basic.txt.j2）
+        context: dict，包含所有解析后的数据
+        返回渲染后的文本
+        """
+```
+
+### 6.6 设备检测器（engine/device_detector.py）
+
+```python
+class DeviceDetector:
+    def detect(self, connection):
+        """
+        自动识别设备厂商/型号/OS
+        返回 {vendor, model, os_version, hostname, serial_number}
+        """
+
+    def parse(self, raw_output):
+        """从 show version 输出解析设备信息"""
+        # 尝试匹配 Cisco 格式
+        # 尝试匹配 Huawei 格式
+        # 尝试匹配 H3C 格式
+```
+
+### 6.7 配置管理器（engine/config_manager.py）
+
+```python
+class ConfigManager:
+    def get_running_config(self, client, vendor):
+        """获取运行配置"""
+        # Cisco: show running-config
+        # Huawei: display current-configuration
+
+    def get_startup_config(self, client, vendor):
+        """获取启动配置"""
+        # Cisco: show startup-config
+        # Huawei: display saved-configuration
+
+    def diff_configs(self, running, startup):
+        """计算两个配置的差异"""
+        # 使用 difflib
+
+    def format_diff_html(self, running, startup):
+        """格式化为 HTML diff（用于前端 Monaco Editor）"""
+```
+
+### 6.8 加密模块（engine/crypto.py）
+
+```python
+class CryptoManager:
+    """
+    加盐加密方案：
+    1. 生成随机盐 salt（16 字节）
+    2. PBKDF2(salt + master_password, iterations=100000, hash=sha256) → 256位密钥
+    3. AES-256-GCM 加密
+    4. 存储：base64(salt + nonce + ciphertext + tag)
+    """
+
+    def encrypt(self, plaintext, master_password):
+        """加盐加密"""
+
+    def decrypt(self, ciphertext_b64, master_password):
+        """解密"""
+
+    def hash_master_password(self, master_password):
+        """生成主密码验证哈希"""
+
+    def verify_master_password(self, password, hash_value):
+        """验证主密码"""
+```
+
+### 6.9 Ping 检测（engine/ping.py）
+
+```python
+class PingChecker:
+    def ping(self, host, count=3, timeout=5):
+        """
+        执行 Ping 检测
+        返回 {success, latency_ms, packet_loss}
+        """
+        # subprocess 调用系统 ping
+```
+
+### 6.10 TCP 检测（engine/tcp_check.py）
+
+```python
+class TCPChecker:
+    def check(self, host, port=22, timeout=5):
+        """
+        TCP 连接检测
+        返回 {is_alive, latency_ms}
+        """
+        # socket 连接测试
+```
+
+---
+
+## 七、三段管道完整流程
+
+### 7.1 巡检管道
+
+```
+用户点击"执行巡检"
+        │
+        ▼
+┌───────────────────────────────────────────┐
+│  start_inspection(task_id)                │
+│                                           │
+│  1. 获取任务关联的设备和模板                │
+│  2. 对每个设备创建 InspectionResult 记录   │
+│  3. 根据设备厂商适配命令                   │
+│  4. 发送采集任务到 queue:collect           │
+│     collect_device_data.delay(            │
+│       result_id, device_id, commands      │
+│     )                                     │
+└──────────────────┬────────────────────────┘
+                   │
+                   ▼
+┌───────────────────────────────────────────┐
+│  queue:collect 采集任务                    │
+│  concurrency=1，每台设备串行连接            │
+│                                           │
+│  1. acquire_device_lock(device_id)        │
+│     失败 → 延迟 5 秒重试                  │
+│  2. SSH/Telnet 连接设备                   │
+│  3. 逐条执行命令：                         │
+│     cmd1 → 输出存入 Redis Hash            │
+│     cmd2 → 输出存入 Redis Hash            │
+│     cmd3 → 输出存入 Redis Hash            │
+│     ...                                   │
+│  4. 全部执行完毕 → 立即断开连接            │
+│  5. release_device_lock(device_id)        │
+│  6. 更新 result.status = "collected"      │
+│  7. 触发解析任务：                         │
+│     parse_device_data.delay(              │
+│       result_id, device_id                │
+│     ) → queue:parse                      │
+└──────────────────┬────────────────────────┘
+                   │
+                   ▼
+┌───────────────────────────────────────────┐
+│  queue:parse 解析任务                      │
+│  concurrency=4，可并发，不需要网络连接       │
+│                                           │
+│  1. 从 Redis Hash 读取所有原始输出          │
+│  2. 逐条用 TextFSM 解析：                  │
+│     alias1 输出 + textfsm 模板 → list[dict]│
+│     alias2 输出 + textfsm 模板 → list[dict]│
+│     ...                                   │
+│  3. 合并设备基本信息到 parsed_data          │
+│  4. parsed_data 存入 Redis（供渲染）        │
+│  5. parsed_data 存入 MySQL（持久化）        │
+│  6. 删除 Redis 原始输出缓存                 │
+│  7. 更新 result.status = "parsed"         │
+│  8. 触发渲染任务：                         │
+│     render_inspection.delay(              │
+│       result_id, device_id                │
+│     ) → queue:render                     │
+└──────────────────┬────────────────────────┘
+                   │
+                   ▼
+┌───────────────────────────────────────────┐
+│  queue:render 渲染任务                     │
+│  concurrency=4，可并发，不需要网络连接       │
+│                                           │
+│  1. 从 Redis 读取 parsed_data              │
+│     Redis 过期 → 从 MySQL 读取             │
+│  2. Jinja2 模板渲染报告                     │
+│  3. 保存报告文件到磁盘                     │
+│  4. 更新 result（报告内容/文件路径/状态）    │
+│  5. 删除 Redis 解析缓存                     │
+│  6. 检查该任务所有设备是否全部完成           │
+│     全部完成 → 更新任务状态 → 发送通知      │
+└───────────────────────────────────────────┘
+```
+
+### 7.2 巡检任务编排代码
+
+```python
+# backend/apps/inspection/tasks.py
+
+from celery import shared_task
+from engine.ssh import SSHClient
+from engine.telnet import TelnetClient
+from engine.textfsm_parser import TextFSMParser
+from engine.jinja2_renderer import Jinja2Renderer
+from engine.cache import DeviceDataCache
+from engine.crypto import CryptoManager
+
+cache = DeviceDataCache()
+textfsm = TextFSMParser()
+jinja2 = Jinja2Renderer()
+crypto = CryptoManager()
+
+
+# ===== 管道入口 =====
+
+@shared_task
+def start_inspection(task_id):
+    """巡检入口：创建 Result 记录，分发采集任务"""
+    from apps.inspection.models import InspectionTask, InspectionResult
+    from apps.devices.models import Device
+
+    task = InspectionTask.objects.get(id=task_id)
+    template = task.template
+
+    for device_id in task.device_ids:
+        device = Device.objects.get(id=device_id)
+        commands = _adapt_commands(template, device)
+
+        InspectionResult.objects.create(
+            task=task, device=device, template=template,
+            status='collecting', started_at=timezone.now()
+        )
+
+        collect_device_data.delay(result.id, device_id, commands)
+
+    task.status = 'running'
+    task.last_run_at = timezone.now()
+    task.save(update_fields=['status', 'last_run_at'])
+
+
+def _adapt_commands(template, device):
+    """根据设备厂商适配命令"""
+    vendor = (device.vendor or 'default').lower()
+    adapted = []
+    for cmd_def in template.commands:
+        actual = cmd_def['commands'].get(vendor, cmd_def['commands'].get('default'))
+        adapted.append({'cmd': actual, 'alias': cmd_def['alias']})
+    return adapted
+
+
+# ===== 第一段：采集 =====
+
+@shared_task(bind=True, max_retries=1, default_retry_delay=5,
+             queue='collect', rate_limit='60/m')
+def collect_device_data(self, result_id, device_id, commands):
+    """
+    采集队列：连接 → 执行命令 → 存缓存 → 断开
+    """
+    from apps.devices.models import Device
+
+    device = Device.objects.get(id=device_id)
+
+    if not cache.acquire_device_lock(device_id):
+        raise self.retry(countdown=5)
+
+    try:
+        client = _create_connection(device)
+        try:
+            for cmd_info in commands:
+                try:
+                    output = client.execute(cmd_info['cmd'], timeout=30)
+                    cache.store_raw_output(result_id, device_id, cmd_info['alias'], output)
+                except Exception as e:
+                    cache.store_raw_output(result_id, device_id, cmd_info['alias'], f'ERROR: {e}')
+        finally:
+            client.close()  # 必须关闭连接
+
+        _update_result_status(result_id, device_id, 'collected')
+        parse_device_data.delay(result_id, device_id)
+
+    except Exception as e:
+        _update_result_status(result_id, device_id, 'collect_failed', str(e))
+    finally:
+        cache.release_device_lock(device_id)
+
+
+def _create_connection(device):
+    """根据登录方式创建连接"""
+    credential = device.credential
+    password = crypto.decrypt(credential.password, get_master_password())
+
+    if device.login_method == 'ssh':
+        client = SSHClient()
+        client.connect(device.ip, device.port or 22, credential.username, password)
+    elif device.login_method == 'telnet':
+        client = TelnetClient()
+        client.connect(device.ip, device.port or 23, credential.username, password)
+    else:
+        raise ValueError(f'不支持: {device.login_method}')
+    return client
+
+
+# ===== 第二段：解析 =====
+
+@shared_task(queue='parse')
+def parse_device_data(result_id, device_id):
+    """
+    解析队列：从 Redis 读取原始输出 → TextFSM 解析 → 存入 DB
+    不需要网络连接
+    """
+    from apps.inspection.models import InspectionResult
+
+    result = InspectionResult.objects.get(id=result_id)
+    template = result.template
+
+    raw_outputs = cache.get_raw_outputs(result_id, device_id)
+    if not raw_outputs:
+        _update_result_status(result_id, device_id, 'parse_failed', '缓存已过期')
+        return
+
+    parsed_data = {}
+    for cmd_def in template.commands:
+        alias = cmd_def['alias']
+        fsm = cmd_def.get('fsm')
+        raw = raw_outputs.get(alias, '')
+
+        if raw.startswith('ERROR:'):
+            parsed_data[alias] = {'error': raw}
+            continue
+
+        if fsm:
+            try:
+                parsed_data[alias] = textfsm.parse(template.vendor or 'generic', fsm, raw)
+            except Exception as e:
+                parsed_data[alias] = {'error': str(e)}
+        else:
+            parsed_data[alias] = {'raw': raw}
+
+    device = Device.objects.get(id=device_id)
+    parsed_data['_device'] = {
+        'name': device.name, 'ip': device.ip,
+        'vendor': device.vendor, 'model': device.model,
+        'hostname': device.hostname, 'os_version': device.os_version,
+    }
+    parsed_data['_meta'] = {
+        'result_id': result_id, 'device_id': device_id,
+        'generated_at': timezone.now().isoformat(),
+    }
+
+    cache.store_parsed_data(result_id, device_id, parsed_data)
+    result.parsed_data = parsed_data
+    result.status = 'parsed'
+    result.save(update_fields=['parsed_data', 'status'])
+    cache.delete_raw_outputs(result_id, device_id)
+
+    render_inspection.delay(result_id, device_id)
+
+
+# ===== 第三段：渲染 =====
+
+@shared_task(queue='render')
+def render_inspection(result_id, device_id):
+    """
+    渲染队列：从 Redis 读取解析数据 → Jinja2 渲染 → 生成报告
+    不需要网络连接
+    """
+    from apps.inspection.models import InspectionResult
+
+    result = InspectionResult.objects.get(id=result_id)
+
+    parsed_data = cache.get_parsed_data(result_id, device_id) or result.parsed_data
+    if not parsed_data:
+        _update_result_status(result_id, device_id, 'render_failed', '解析数据不存在')
+        return
+
+    tpl_name = result.template.jinja2_template_name or 'inspection_basic.txt.j2'
+    try:
+        report = jinja2.render(tpl_name, parsed_data)
+    except Exception as e:
+        _update_result_status(result_id, device_id, 'render_failed', str(e))
+        return
+
+    report_dir = os.path.join(settings.MEDIA_ROOT, 'reports')
+    os.makedirs(report_dir, exist_ok=True)
+    filename = f'inspection_{result_id}_{device_id}_{int(time.time())}.txt'
+    path = os.path.join(report_dir, filename)
+    with open(path, 'w', encoding='utf-8') as f:
+        f.write(report)
+
+    result.report_content = report
+    result.report_file_path = path
+    result.status = 'success'
+    result.finished_at = timezone.now()
+    result.save()
+    cache.delete_parsed_data(result_id, device_id)
+
+    _check_task_completion(result.task_id)
+
+
+def _check_task_completion(task_id):
+    """检查任务是否全部完成"""
+    from apps.inspection.models import InspectionResult, InspectionTask
+    from apps.notification.tasks import send_notification
+
+    total = InspectionResult.objects.filter(task_id=task_id).count()
+    done = InspectionResult.objects.filter(
+        task_id=task_id,
+        status__in=['success', 'collect_failed', 'parse_failed', 'render_failed']
+    ).count()
+
+    if done >= total:
+        task = InspectionTask.objects.get(id=task_id)
+        task.status = 'completed'
+        task.save(update_fields=['status'])
+        ok = InspectionResult.objects.filter(task_id=task_id, status='success').count()
+        send_notification.delay(
+            type='inspection_complete',
+            title=f'巡检完成: {task.name}',
+            message=f'共 {total} 台，成功 {ok} 台，失败 {total - ok} 台'
+        )
+
+
+def _update_result_status(result_id, device_id, status, error=''):
+    from apps.inspection.models import InspectionResult
+    InspectionResult.objects.filter(id=result_id).update(
+        status=status, error_message=error
+    )
+```
+
+### 7.3 扫描管道
+
+```python
+# backend/apps/scanning/tasks.py
+
+@shared_task
+def start_scan(task_id):
+    """扫描入口"""
+    task = ScanTask.objects.get(id=task_id)
+    ips = parse_targets(task.targets)  # 解析 IP 范围/列表
+    task.status = 'running'
+    task.save(update_fields=['status'])
+    for ip in ips:
+        scan_probe.delay(task_id, ip, task.credential_id, task.port)
+
+
+@shared_task(rate_limit='10/m', queue='scan')
+def scan_probe(task_id, ip, credential_id, port):
+    """扫描探测：端口探测 → 连接识别 → 存缓存 → 断开"""
+    import socket
+
+    # TCP 端口快速探测
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.settimeout(3)
+    ok = sock.connect_ex((ip, port)) == 0
+    sock.close()
+    if not ok:
+        ScanResult.objects.create(task_id=task_id, ip=ip, port=port, status='not_found')
+        return
+
+    credential = Credential.objects.get(id=credential_id)
+    password = crypto.decrypt(credential.password, get_master_password())
+    raw_output = None
+    login_method = None
+
+    # 先试 SSH
+    try:
+        c = SSHClient()
+        c.connect(ip, port, credential.username, password)
+        raw_output = c.execute('show version', timeout=15)
+        if not raw_output:
+            raw_output = c.execute('display version', timeout=15)
+        login_method = 'ssh'
+        c.close()
+    except:
+        pass
+
+    # 再试 Telnet
+    if not raw_output:
+        try:
+            c = TelnetClient()
+            c.connect(ip, port, credential.username, password)
+            raw_output = c.execute('show version', timeout=15)
+            if not raw_output:
+                raw_output = c.execute('display version', timeout=15)
+            login_method = 'telnet'
+            c.close()
+        except:
+            pass
+
+    if not raw_output:
+        ScanResult.objects.create(task_id=task_id, ip=ip, port=port, status='error')
+        return
+
+    cache.store_scan_raw(task_id, ip, raw_output)
+    parse_scan_result.delay(task_id, ip, login_method)
+
+
+@shared_task(queue='default')
+def parse_scan_result(task_id, ip, login_method):
+    """解析扫描结果 → 自动入库"""
+    task = ScanTask.objects.get(id=task_id)
+    raw = cache.get_scan_raw(task_id, ip)
+    if not raw:
+        return
+
+    info = DeviceDetector().parse(raw)
+
+    scan_result = ScanResult.objects.create(
+        task_id=task_id, ip=ip, port=task.port, status='found',
+        vendor=info.get('vendor'), model=info.get('model'),
+        os_version=info.get('os_version'), hostname=info.get('hostname'),
+        raw_output=raw[:2000],
+    )
+
+    if task.auto_add:
+        device, created = Device.objects.get_or_create(
+            ip=ip,
+            defaults={
+                'name': info.get('hostname') or f'device-{ip.replace(".", "-")}',
+                'vendor': info.get('vendor'),
+                'model': info.get('model'),
+                'os_version': info.get('os_version'),
+                'hostname': info.get('hostname'),
+                'serial_number': info.get('serial_number'),
+                'login_method': login_method,
+                'credential': task.credential,
+                'port': task.port,
+                'status': 'online',
+                'last_seen_at': timezone.now(),
+            }
+        )
+        scan_result.device = device
+        scan_result.save(update_fields=['device'])
+        if created and task.auto_verify:
+            collect_device_info.delay(device.id)
+
+    cache.redis.delete(f'beeadmin:scan:{task_id}:{ip}:raw')
+```
+
+### 7.4 存活检测管道
+
+```python
+# backend/apps/alive/tasks.py
+
+@shared_task
+def start_alive_check(task_id):
+    """存活检测入口"""
+    task = AliveTask.objects.get(id=task_id)
+
+    # 获取上次结果
+    last = {}
+    for did in task.device_ids:
+        r = AliveResult.objects.filter(task_id=task_id, device_id=did).order_by('-checked_at').first()
+        if r:
+            last[did] = r.is_alive
+
+    for did in task.device_ids:
+        device = Device.objects.get(id=did)
+        alive_check_device.delay(
+            task_id=task_id, device_id=did, device_ip=device.ip,
+            check_type=task.check_type, timeout=task.timeout_seconds,
+            last_alive=last.get(did), notify_email=task.notify_email,
+            bandwidth_limit=task.bandwidth_limit_mbps,
+            connection_limit=task.connection_limit,
+        )
+
+
+@shared_task(queue='alive', rate_limit='30/m', soft_time_limit=30, time_limit=35)
+def alive_check_device(task_id, device_id, device_ip, check_type,
+                       timeout, last_alive, notify_email,
+                       bandwidth_limit, connection_limit):
+    """单设备存活检测"""
+    # 检查连接数限制
+    current = cache.incr_alive_connections()
+    if current > connection_limit:
+        cache.decr_alive_connections()
+        return  # 超限跳过
+
+    try:
+        is_alive = False
+        latency = None
+        loss = None
+
+        if check_type in ('ping', 'both'):
+            r = PingChecker().ping(device_ip, count=3, timeout=timeout)
+            if r['success']:
+                is_alive = True
+                latency = r['latency_ms']
+                loss = r['packet_loss']
+
+        if check_type in ('tcp', 'both'):
+            r = TCPChecker().check(device_ip, port=22, timeout=timeout)
+            if r['is_alive']:
+                is_alive = True
+                if latency is None:
+                    latency = r['latency_ms']
+
+        AliveResult.objects.create(
+            task_id=task_id, device_id=device_id,
+            is_alive=is_alive, latency_ms=latency,
+            packet_loss_percent=loss, checked_at=timezone.now()
+        )
+
+        # 状态变化通知
+        if last_alive is not None:
+            device = Device.objects.get(id=device_id)
+            if last_alive and not is_alive:
+                device.status = 'offline'
+                device.save(update_fields=['status'])
+                send_notification.delay(
+                    type='device_offline',
+                    title=f'设备离线: {device.name}',
+                    message=f'{device.name} ({device.ip}) 已离线',
+                    device_id=device_id, send_email=notify_email
+                )
+            elif not last_alive and is_alive:
+                device.status = 'online'
+                device.last_seen_at = timezone.now()
+                device.save(update_fields=['status', 'last_seen_at'])
+                send_notification.delay(
+                    type='device_online',
+                    title=f'设备上线: {device.name}',
+                    message=f'{device.name} ({device.ip}) 已恢复在线',
+                    device_id=device_id, send_email=notify_email
+                )
+    finally:
+        cache.decr_alive_connections()
+```
+
+### 7.5 配置备份管道
+
+```python
+# backend/apps/devices/tasks.py
+
+@shared_task(bind=True, max_retries=1, queue='collect')
+def backup_device_config(self, device_id):
+    """配置备份：连接 → 拉取配置 → 存储 → 断开"""
+    device = Device.objects.get(id=device_id)
+    if not cache.acquire_device_lock(device_id):
+        raise self.retry(countdown=5)
+    try:
+        client = _create_connection(device)
+        try:
+            cm = ConfigManager()
+            vendor = device.vendor or 'default'
+
+            running = cm.get_running_config(client, vendor)
+            if running:
+                v = ConfigBackup.objects.filter(device_id=device_id, config_type='running').count() + 1
+                ConfigBackup.objects.create(device=device, config_type='running', content=running, version=v)
+
+            startup = cm.get_startup_config(client, vendor)
+            if startup:
+                v = ConfigBackup.objects.filter(device_id=device_id, config_type='startup').count() + 1
+                ConfigBackup.objects.create(device=device, config_type='startup', content=startup, version=v)
+
+            device.last_backup_at = timezone.now()
+            device.save(update_fields=['last_backup_at'])
+        finally:
+            client.close()
+    finally:
+        cache.release_device_lock(device_id)
+```
+
+---
+
+## 八、Celery 配置
+
+### 8.1 Celery 应用
+
+```python
+# backend/beeadmin/celery.py
+
+from celery import Celery
+from kombu import Queue, Exchange
+
+app = Celery('beeadmin')
+app.config_from_object('django.conf:settings', namespace='CELERY')
+
+app.conf.task_queues = (
+    Queue('collect',  Exchange('collect'),  routing_key='collect'),
+    Queue('parse',    Exchange('parse'),    routing_key='parse'),
+    Queue('render',   Exchange('render'),   routing_key='render'),
+    Queue('alive',    Exchange('alive'),    routing_key='alive'),
+    Queue('scan',     Exchange('scan'),     routing_key='scan'),
+    Queue('notify',   Exchange('notify'),   routing_key='notify'),
+    Queue('default',  Exchange('default'),  routing_key='default'),
+)
+
+app.conf.task_routes = {
+    'apps.inspection.tasks.collect_device_data':    {'queue': 'collect'},
+    'apps.inspection.tasks.parse_device_data':      {'queue': 'parse'},
+    'apps.inspection.tasks.render_inspection':      {'queue': 'render'},
+    'apps.alive.tasks.*':                           {'queue': 'alive'},
+    'apps.scanning.tasks.*':                        {'queue': 'scan'},
+    'apps.notification.tasks.*':                    {'queue': 'notify'},
+    'apps.devices.tasks.collect_device_info':       {'queue': 'collect'},
+    'apps.devices.tasks.backup_device_config':      {'queue': 'collect'},
+    'apps.system.tasks.*':                          {'queue': 'default'},
+}
+
+app.autodiscover_tasks()
+```
+
+### 8.2 Docker Compose
+
+```yaml
+version: '3.8'
+
+services:
+  mysql:
+    image: mysql:8.0
+    environment:
+      MYSQL_ROOT_PASSWORD: rootpassword
+      MYSQL_DATABASE: beeadmin
+      MYSQL_USER: beeadmin
+      MYSQL_PASSWORD: beeadmin123
+    volumes:
+      - mysql_data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  backend:
+    build: ./backend
+    ports:
+      - "8000:8000"
+    environment: &env
+      DB_HOST: mysql
+      DB_PORT: 3306
+      DB_NAME: beeadmin
+      DB_USER: beeadmin
+      DB_PASSWORD: beeadmin123
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      CELERY_BROKER_URL: redis://redis:6379/1
+      CELERY_RESULT_BACKEND: redis://redis:6379/2
+    depends_on:
+      mysql: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/api/v1/health/"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+
+  celery-collect:
+    build: ./backend
+    command: celery -A beeadmin worker -Q collect --concurrency=1 --hostname=collect@%h -l info
+    environment: *env
+    depends_on: [backend]
+
+  celery-parse:
+    build: ./backend
+    command: celery -A beeadmin worker -Q parse --concurrency=4 --hostname=parse@%h -l info
+    environment: *env
+    depends_on: [backend]
+
+  celery-render:
+    build: ./backend
+    command: celery -A beeadmin worker -Q render --concurrency=4 --hostname=render@%h -l info
+    environment: *env
+    depends_on: [backend]
+
+  celery-alive:
+    build: ./backend
+    command: celery -A beeadmin worker -Q alive --concurrency=2 --hostname=alive@%h -l info
+    environment: *env
+    depends_on: [backend]
+
+  celery-scan:
+    build: ./backend
+    command: celery -A beeadmin worker -Q scan --concurrency=3 --hostname=scan@%h -l info
+    environment: *env
+    depends_on: [backend]
+
+  celery-default:
+    build: ./backend
+    command: celery -A beeadmin worker -Q notify,default --concurrency=2 --hostname=default@%h -l info
+    environment: *env
+    depends_on: [backend]
+
+  celery-beat:
+    build: ./backend
+    command: celery -A beeadmin beat -l info --scheduler django_celery_beat.schedulers:DatabaseScheduler
+    environment: *env
+    depends_on: [backend]
+
+  frontend-pc:
+    build: ./frontend-pc
+    ports: ["3000:3000"]
+    depends_on: [backend]
+
+  frontend-mobile:
+    build: ./frontend-mobile
+    ports: ["3001:3001"]
+    depends_on: [backend]
+
+volumes:
+  mysql_data:
+  redis_data:
+```
+
+---
+
+## 九、API 总览
+
+```
+/api/v1/
+
+├── setup/
+│   GET    /status
+│   POST   /initialize
+
+├── auth/
+│   POST   /login
+│   POST   /unlock
+│   POST   /lock
+│   POST   /logout
+│   GET    /me
+│   PUT    /password
+│   PUT    /master-password
+
+├── health/
+│   GET    /                              健康检查（Django/MySQL/Redis/Celery）
+
+├── dashboard/
+│   GET    /counts
+│   GET    /vendors
+│   GET    /recent-inspections
+│   GET    /recent-scans
+│   GET    /alive-alerts
+│   GET    /notifications
+
+├── devices/
+│   GET    /                              ?group=&keyword=&status=&vendor=
+│   POST   /
+│   GET    /:id
+│   PUT    /:id
+│   DELETE /:id
+│   POST   /:id/test
+│   POST   /:id/collect
+│   GET    /:id/info
+│   GET    /:id/config/running
+│   GET    /:id/config/startup
+│   POST   /:id/config/backup
+│   GET    /:id/config/diff
+│   GET    /:id/config/history
+│   POST   /export                        可选字段导出
+│   POST   /import
+│   POST   /batch-delete
+
+├── device-groups/
+│   GET    /
+│   POST   /
+│   PUT    /:id
+│   DELETE /:id
+│   POST   /:id/members
+│   DELETE /:id/members/:deviceId
+
+├── scanning/
+│   GET    /tasks
+│   POST   /tasks
+│   GET    /tasks/:id
+│   PUT    /tasks/:id
+│   DELETE /tasks/:id
+│   POST   /tasks/:id/run
+│   POST   /tasks/:id/toggle
+│   GET    /tasks/:id/results
+│   GET    /results/:id
+
+├── inspection/
+│   GET    /templates
+│   POST   /templates
+│   GET    /templates/:id
+│   PUT    /templates/:id
+│   DELETE /templates/:id
+│   POST   /templates/:id/clone
+│   GET    /tasks
+│   POST   /tasks
+│   GET    /tasks/:id
+│   PUT    /tasks/:id
+│   DELETE /tasks/:id
+│   POST   /tasks/:id/run
+│   POST   /tasks/:id/toggle
+│   GET    /tasks/:id/results
+│   GET    /results/:id
+│   GET    /results/:id/report
+│   GET    /results/:id/export
+
+├── alive/
+│   GET    /tasks
+│   POST   /tasks
+│   GET    /tasks/:id
+│   PUT    /tasks/:id
+│   DELETE /tasks/:id
+│   POST   /tasks/:id/run
+│   POST   /tasks/:id/toggle
+│   GET    /tasks/:id/results
+│   GET    /tasks/:id/status
+│   GET    /tasks/:id/alerts
+
+├── terminal/
+│   GET    /ssh/:deviceId/ws
+│   GET    /telnet/:deviceId/ws
+│   GET    /instant/history
+│   DELETE /instant/history/:id
+│   GET    /instant/:id/log
+
+├── notification/
+│   GET    /                              ?is_read=&type=
+│   PUT    /:id/read
+│   POST   /read-all
+│   GET    /email-config
+│   PUT    /email-config
+│   POST   /email-config/test
+
+├── ai/
+│   POST   /analyze/terminal
+│   POST   /chat
+│   GET    /config
+│   PUT    /config
+
+└── system/
+    GET    /settings
+    PUT    /settings
+    GET    /auto-backup
+    PUT    /auto-backup
+    POST   /backup
+    POST   /restore
+    GET    /templates/textfsm
+    POST   /templates/textfsm
+    PUT    /templates/textfsm/:id
+    DELETE /templates/textfsm/:id
+    GET    /templates/jinja2
+    POST   /templates/jinja2
+    PUT    /templates/jinja2/:id
+    DELETE /templates/jinja2/:id
+    GET    /health
+```
+
+---
+
+## 十、安全与加密
+
+### 10.1 加盐加密
+
+```
+必须加密的字段：
+  Credential.password
+  Credential.enable_password
+  Credential.ssh_key
+  EmailConfig.sender_password
+  AIConfig.api_key
+
+加密方案：
+  1. 生成随机盐 salt（16 字节）
+  2. PBKDF2(salt + master_password, iterations=100000, sha256) → 256位密钥
+  3. AES-256-GCM 加密
+  4. 存储：base64(salt + nonce + ciphertext + tag)
+  5. 每字段独立盐值
+
+主密码管理：
+  初始化时设置
+  存 PBKDF2 验证哈希
+  登录后需输入主密码解锁
+  解锁后密钥缓存在 Redis DB0（TTL = 会话超时时间）
+  超时自动清除
+```
+
+### 10.2 登录认证
+
+```
+管理员 + 密码 → Django authenticate → JWT Token
+Token 有效期可配置（默认 30 分钟）
+支持"记住我"
+主密码解锁后才能访问加密数据
+```
+
+---
+
+## 十一、UI 规范
+
+### 11.1 左侧小菜单
+
+```
+宽度：64px
+图标在上（24px），文字在下（12px），居中
+Element Plus el-menu，collapse=true
+选中态：背景高亮 + 左侧 3px 色条
+
+┌────────┐
+│  📊    │
+│ 仪表盘  │
+├────────┤
+│  🖥️    │
+│  设备   │
+├────────┤
+│  ⚡    │
+│ 即时登录│
+├────────┤
+│  ⚙️    │
+│ 系统设置│
+└────────┘
+```
+
+### 11.2 设备二级 Tab
+
+```
+┌──────────────────────────────────────────────────────────────┐
+│  设备管理                                          [+ 添加]  │
+│  [设备列表] [扫描任务] [巡检管理] [存活检测] [执行记录]        │
+├──────────────────────────────────────────────────────────────┤
+│                    当前 Tab 内容                              │
+└──────────────────────────────────────────────────────────────┘
+```
+
+### 11.3 设备列表（类阿里云 ECS）
+
+```
+列：勾选 / 名称 / IP / 厂商 / 型号 / OS / 状态 / 最后巡检 / 最后备份
+顶部：设备组 Tab + 搜索 + 状态/厂商筛选
+底部：批量操作（执行巡检/采集信息/备份配置/删除）
+      [导出设备信息] 弹出选择导出字段
+```
+
+### 11.4 设备详情（类阿里云 ECS 详情）
+
+```
+顶部：名称 + IP + 厂商/型号/OS + 状态 + 设备组/标签
+Tab：概览 / 接口 / 路由 / ARP / MAC / 配置对比 / 巡检历史 / SSH终端
+```
+
+### 11.5 配置对比（左右编辑器）
+
+```
+┌──────────────────────────────────────────────────────────────┐
+│  配置对比                                    [刷新] [导出]    │
+├───────────────────────────┬──────────────────────────────────┤
+│  运行配置（参照）          │  启动配置（差异标红）              │
+│                           │                                  │
+│  hostname SW-Core         │  hostname SW-Core                │
+│  interface Gi0/1          │  interface Gi0/1                 │
+│   ip addr 10.0.0.1 255…  │   ip addr 10.0.0.2 255…  ← 红色 │
+│   no shutdown             │   shutdown                ← 红色 │
+│  interface Gi0/2          │  !                       ← 红色 │
+│   ip addr 10.0.1.1 255…  │                                  │
+│  end                      │  end                             │
+└───────────────────────────┴──────────────────────────────────┘
+```
+
+### 11.6 小蜜蜂 AI 浮窗
+
+```
+全局左下角固定，所有页面可见
+收起态：[🐝]
+展开态：对话区 + 输入框 + 快捷按钮
+在终端 Tab → [分析终端] 按钮
+其他页面 → 通用 AI 助手
+```
+
+---
+
+## 十二、巡检模板规范
+
+### 12.1 默认模板
+
+```
+系统内置默认模板（可克隆修改）：
+
+"基础巡检 - Cisco IOS"：
+  commands: [
+    {alias: "show_version", fsm: "show_version",
+     commands: {cisco: "show version", huawei: "display version", default: "show version"}},
+    {alias: "show_ip_int_brief", fsm: "show_ip_interface_brief",
+     commands: {cisco: "show ip interface brief", huawei: "display ip interface brief"}},
+    {alias: "show_proc_cpu", fsm: "show_processes_cpu",
+     commands: {cisco: "show processes cpu", huawei: "display cpu-usage"}},
+    {alias: "show_memory", fsm: "show_memory_statistics",
+     commands: {cisco: "show memory statistics", huawei: "display memory"}},
+    {alias: "show_logging", fsm: "show_logging",
+     commands: {cisco: "show logging | last 10", huawei: "display logbuffer | include ERROR"}},
+  ]
+  jinja2: "inspection_basic.txt.j2"
+
+"基础巡检 - Huawei VRP"：同上，命令适配华为
+```
+
+### 12.2 Jinja2 模板示例
+
+```
+templates/jinja2/inspection_basic.txt.j2：
+
+====================================================
+          设备巡检报告
+====================================================
+设备名称: {{ _device.name | default('N/A') }}
+IP地址:   {{ _device.ip }}
+厂商:     {{ _device.vendor | default('N/A') }}
+型号:     {{ _device.model | default('N/A') }}
+OS版本:   {{ _device.os_version | default('N/A') }}
+
+----------------------------------------------------
+  系统资源
+----------------------------------------------------
+{% if show_version %}
+运行时间: {{ show_version[0].uptime | default('N/A') }}
+序列号:   {{ show_version[0].serial | default('N/A') }}
+{% endif %}
+
+{% if show_proc_cpu %}
+CPU使用率: {{ show_proc_cpu[0].cpu_5_sec | default('N/A') }}%
+{% endif %}
+
+{% if show_memory %}
+内存使用: {{ show_memory[0].used | default('N/A') }} / {{ show_memory[0].total | default('N/A') }}
+{% endif %}
+
+----------------------------------------------------
+  接口状态
+----------------------------------------------------
+{% for intf in show_ip_int_brief | default([]) %}
+{{ intf.intf | default('N/A') }}  {{ intf.ipaddr | default('unassigned') }}  {{ intf.status | default('N/A') }}  {{ intf.proto | default('N/A') }}
+{% endfor %}
+
+----------------------------------------------------
+  最近错误日志
+----------------------------------------------------
+{% for log in show_logging | default([]) %}
+{{ log.timestamp | default('') }} {{ log.severity | default('') }} {{ log.message | default('') }}
+{% endfor %}
+
+====================================================
+报告生成时间: {{ _meta.generated_at }}
+====================================================
+```
+
+### 12.3 TextFSM 模板示例
+
+```
+templates/textfsm/cisco_ios/show_version.textfsm：
+
+Value Filldown HOSTNAME (\S+)
+Value Filldown UPTIME (.+?)
+Value OS_VERSION (\d+\.\d+\([\w.]+\)\w*)
+Value MODEL (\S+)
+Value SERIAL (\w+)
+
+Start
+  ^\S+ uptime is ${UPTIME}
+  ^\s+Model number\s*:\s+${MODEL}
+  ^\s+Processor board ID\s+${SERIAL}
+  ^Cisco IOS Software.*Version\s+${OS_VERSION}
+  ^\S+#\s*$$ -> Record
+```
+
+---
+
+## 十三、前端路由
+
+```
+/
+├── /setup
+├── /login
+├── /dashboard
+│
+├── /devices
+├── /devices/:id
+│   ?tab=overview|interfaces|routes|arp|mac|config|inspection|terminal
+│
+├── /scanning
+├── /scanning/:id/results
+│
+├── /inspection
+│   ?tab=templates|tasks
+├── /inspection/results/:id
+│
+├── /alive
+├── /alive/:id/results
+│
+├── /history
+│
+├── /instant
+│
+└── /settings
+    ?tab=general|security|notification|ai|backup|data|about
+```
+
+---
+
+## 十四、Pinia Store 清单
+
+```
+stores/
+├── app.ts              全局状态：主题、语言、侧栏
+├── auth.ts             认证：登录、解锁、Token
+├── dashboard.ts        仪表盘数据
+├── device.ts           设备：列表、详情、CRUD
+├── deviceGroup.ts      设备组
+├── scanning.ts         扫描任务和结果
+├── inspection.ts       巡检模板、任务、结果
+├── alive.ts            存活检测任务和结果
+├── terminal.ts         终端会话管理
+├── notification.ts     通知列表和未读数
+├── ai.ts               AI 配置和对话
+└── settings.ts         系统设置
+```
+
+---
+
+## 十五、启动参数
+
+### backend
+
+```
+环境变量：
+  DJANGO_SETTINGS_MODULE=beeadmin.settings.prod
+  SECRET_KEY=xxx
+  DEBUG=False
+  DB_HOST / DB_PORT / DB_NAME / DB_USER / DB_PASSWORD
+  REDIS_HOST / REDIS_PORT
+  CELERY_BROKER_URL=redis://redis:6379/1
+  CELERY_RESULT_BACKEND=redis://redis:6379/2
+  ALLOWED_HOSTS=*
+  LOG_LEVEL=INFO
+  MASTER_PASSWORD_TIMEOUT=1800
+```
+
+### 首次部署
+
+```
+1. docker-compose up -d
+2. 浏览器打开 PC 前端
+3. 自动跳转 /setup
+4. 设置管理员用户名 + 密码 + 主加密密码
+5. 完成 → 登录 → 输入主密码解锁 → 进入系统
+```
+
+---
+
+## 十六、命名与路径
+
+```
+项目名：BeeAdmin
+中文名：蜜蜂网管
+
+后端：backend/
+PC 前端：frontend-pc/
+手机前端：frontend-mobile/
+模板：templates/
+
+用户端本地：~/.beeadmin/
+├── config.yaml
+├── data/beeadmin.db
+├── keys/
+├── templates/（自定义模板）
+├── reports/（巡检报告）
+├── records/（操作日志）
+├── logs/
+└── cache/
+
+API：/api/v1/
+WebSocket：/ws/
+健康检查：/api/v1/health/
+```
+
+---
+
+## 十七、PR 提交规范
+
+```
+Step 1 PR：feat: 初始化所有端项目框架
+Step 2 PR：feat: 完成后端全部功能（模型/API/引擎/三段管道/Celery任务）
+Step 3 PR：feat: 完成 PC 前端和手机前端
+Step 4 PR：test: 集成测试完整流程，修复问题
+```
