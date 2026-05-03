@@ -1,0 +1,12 @@
+Value Filldown HOSTNAME (\S+)
+Value Filldown UPTIME (.+?)
+Value OS_VERSION (\d+\.\d+\([\w.]+\)\w*)
+Value MODEL (\S+)
+Value SERIAL (\w+)
+
+Start
+  ^\S+ uptime is ${UPTIME}
+  ^\s+Model number\s*:\s+${MODEL}
+  ^\s+Processor board ID\s+${SERIAL}
+  ^Cisco IOS Software.*Version\s+${OS_VERSION}
+  ^\S+#\s*$$ -> Record

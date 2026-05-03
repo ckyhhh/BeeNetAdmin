@@ -1,0 +1,63 @@
+====================================================
+          设备巡检报告
+====================================================
+设备名称: {{ _device.name | default('N/A') }}
+IP地址:   {{ _device.ip }}
+厂商:     {{ _device.vendor | default('N/A') }}
+型号:     {{ _device.model | default('N/A') }}
+OS版本:   {{ _device.os_version | default('N/A') }}
+
+----------------------------------------------------
+  系统资源
+----------------------------------------------------
+{% if show_version is defined and show_version %}
+{% if show_version is mapping %}
+运行时间: {{ show_version.get('uptime', 'N/A') }}
+序列号:   {{ show_version.get('serial', 'N/A') }}
+{% elif show_version is iterable and show_version[0] is defined %}
+运行时间: {{ show_version[0].get('uptime', show_version[0].get('UPTIME', 'N/A')) }}
+序列号:   {{ show_version[0].get('serial', show_version[0].get('SERIAL', 'N/A')) }}
+{% endif %}
+{% endif %}
+
+{% if show_proc_cpu is defined and show_proc_cpu %}
+{% if show_proc_cpu is mapping %}
+CPU使用率: {{ show_proc_cpu.get('cpu_5_sec', 'N/A') }}%
+{% elif show_proc_cpu is iterable and show_proc_cpu[0] is defined %}
+CPU使用率: {{ show_proc_cpu[0].get('cpu_5_sec', show_proc_cpu[0].get('CPU_5_SEC', 'N/A')) }}%
+{% endif %}
+{% endif %}
+
+{% if show_memory is defined and show_memory %}
+{% if show_memory is mapping %}
+内存使用: {{ show_memory.get('used', 'N/A') }} / {{ show_memory.get('total', 'N/A') }}
+{% elif show_memory is iterable and show_memory[0] is defined %}
+内存使用: {{ show_memory[0].get('used', show_memory[0].get('USED', 'N/A')) }} / {{ show_memory[0].get('total', show_memory[0].get('TOTAL', 'N/A')) }}
+{% endif %}
+{% endif %}
+
+----------------------------------------------------
+  接口状态
+----------------------------------------------------
+{% if show_ip_int_brief is defined and show_ip_int_brief %}
+{% for intf in show_ip_int_brief %}
+{% if intf is mapping %}
+{{ intf.get('intf', intf.get('INTF', 'N/A')) }}  {{ intf.get('ipaddr', intf.get('IPADDR', 'unassigned')) }}  {{ intf.get('status', intf.get('STATUS', 'N/A')) }}  {{ intf.get('proto', intf.get('PROTO', 'N/A')) }}
+{% endif %}
+{% endfor %}
+{% endif %}
+
+----------------------------------------------------
+  最近错误日志
+----------------------------------------------------
+{% if show_logging is defined and show_logging %}
+{% for log in show_logging %}
+{% if log is mapping %}
+{{ log.get('timestamp', '') }} {{ log.get('severity', '') }} {{ log.get('message', '') }}
+{% endif %}
+{% endfor %}
+{% endif %}
+
+====================================================
+报告生成时间: {{ _meta.generated_at }}
+====================================================

@@ -1,0 +1,9 @@
+Value INTF (\S+)
+Value IPADDR (\S+)
+Value OK (up|down)
+Value METHOD (\S+|\S+\s+\S+)
+Value STATUS (up|down)
+Value PROTO (up|down)
+
+Start
+  ^${INTF}\s+${IPADDR}\s+\S+\s+${OK}\s+${STATUS}\s+${PROTO} -> Record

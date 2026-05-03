@@ -1,0 +1,110 @@
+version: '3.8'
+
+services:
+  mysql:
+    image: mysql:8.0
+    environment:
+      MYSQL_ROOT_PASSWORD: rootpassword
+      MYSQL_DATABASE: beeadmin
+      MYSQL_USER: beeadmin
+      MYSQL_PASSWORD: beeadmin123
+    volumes:
+      - mysql_data:/var/lib/mysql
+    ports:
+      - "3306:3306"
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    volumes:
+      - redis_data:/data
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  backend:
+    build: ./backend
+    ports:
+      - "8000:8000"
+    environment: &env
+      DB_HOST: mysql
+      DB_PORT: "3306"
+      DB_NAME: beeadmin
+      DB_USER: beeadmin
+      DB_PASSWORD: beeadmin123
+      REDIS_HOST: redis
+      REDIS_PORT: "6379"
+      CELERY_BROKER_URL: redis://redis:6379/1
+      CELERY_RESULT_BACKEND: redis://redis:6379/2
+      SECRET_KEY: change-me-in-production
+      DJANGO_SETTINGS_MODULE: beeadmin.settings.prod
+    depends_on:
+      mysql: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    command: >
+      sh -c "python manage.py migrate --noinput &&
+             gunicorn beeadmin.wsgi:application --bind 0.0.0.0:8000 --workers 4"
+
+  celery-collect:
+    build: ./backend
+    command: celery -A beeadmin worker -Q collect --concurrency=1 --hostname=collect@%h -l info
+    environment: *env
+    depends_on: [backend]
+
+  celery-parse:
+    build: ./backend
+    command: celery -A beeadmin worker -Q parse --concurrency=4 --hostname=parse@%h -l info
+    environment: *env
+    depends_on: [backend]
+
+  celery-render:
+    build: ./backend
+    command: celery -A beeadmin worker -Q render --concurrency=4 --hostname=render@%h -l info
+    environment: *env
+    depends_on: [backend]
+
+  celery-alive:
+    build: ./backend
+    command: celery -A beeadmin worker -Q alive --concurrency=2 --hostname=alive@%h -l info
+    environment: *env
+    depends_on: [backend]
+
+  celery-scan:
+    build: ./backend
+    command: celery -A beeadmin worker -Q scan --concurrency=3 --hostname=scan@%h -l info
+    environment: *env
+    depends_on: [backend]
+
+  celery-default:
+    build: ./backend
+    command: celery -A beeadmin worker -Q notify,default --concurrency=2 --hostname=default@%h -l info
+    environment: *env
+    depends_on: [backend]
+
+  celery-beat:
+    build: ./backend
+    command: celery -A beeadmin beat -l info --scheduler django_celery_beat.schedulers:DatabaseScheduler
+    environment: *env
+    depends_on: [backend]
+
+  frontend-pc:
+    build: ./frontend-pc
+    ports: ["3000:3000"]
+    depends_on: [backend]
+
+  frontend-mobile:
+    build: ./frontend-mobile
+    ports: ["3001:3001"]
+    depends_on: [backend]
+
+volumes:
+  mysql_data:
+  redis_data:

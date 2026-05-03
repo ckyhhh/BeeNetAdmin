@@ -1,0 +1,10 @@
+Value VERSION (.+)
+Value MODEL (.+)
+Value SERIAL (\S+)
+Value UPTIME (.+)
+
+Start
+  ^Huawei Versatile Routing Platform Software.*Version ${VERSION}
+  ^HUAWEI\s+\S+\s+uptime is\s+${UPTIME}
+  ^Board Type\s*:\s*${MODEL}
+  ^SERIAL NUMBER\s*:\s*${SERIAL} -> Record

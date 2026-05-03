@@ -1,0 +1,6 @@
+Value TOTAL (\d+)
+Value USED (\d+)
+Value FREE (\d+)
+
+Start
+  ^Total:\s+${TOTAL}\s+Used:\s+${USED}\s+Free:\s+${FREE} -> Record
